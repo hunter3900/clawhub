@@ -22,6 +22,7 @@ import { internal } from './_generated/api'
 import type { Doc, Id } from './_generated/dataModel'
 import type { MutationCtx } from './_generated/server'
 import { internalAction, internalMutation, internalQuery } from './_generated/server'
+import { syncSkillSearchDigest } from './lib/skillSearchDigest'
 import { applySkillStatDeltas, bumpDailySkillStats } from './lib/skillStats'
 
 /**
@@ -259,6 +260,7 @@ export const processSkillStatEventsInternal = internalMutation({
         // Don't update `updatedAt` — stat changes shouldn't move the
         // skill's position in the by_active_updated index.
         await ctx.db.patch(skill._id, patch)
+        await syncSkillSearchDigest(ctx, skill._id)
       }
 
       // NOTE: Daily stats (skillDailyStats) are written by the 15-minute

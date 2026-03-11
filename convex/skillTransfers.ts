@@ -1,6 +1,7 @@
 import { v } from 'convex/values'
 import type { Doc, Id } from './_generated/dataModel'
 import { internalMutation, internalQuery } from './_generated/server'
+import { syncSkillSearchDigest } from './lib/skillSearchDigest'
 
 const TRANSFER_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000
 
@@ -175,6 +176,7 @@ export const acceptTransferInternal = internalMutation({
       ownerUserId: args.actorUserId,
       updatedAt: now,
     })
+    await syncSkillSearchDigest(ctx, skill._id)
     await ctx.db.patch(transfer._id, { status: 'accepted', respondedAt: now })
 
     await ctx.db.insert('auditLogs', {

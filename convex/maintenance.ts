@@ -13,6 +13,7 @@ import {
 } from './lib/skillQuality'
 import { generateSkillSummary } from './lib/skillSummary'
 import { computeIsSuspicious } from './lib/skillSafety'
+import { extractDigestFields } from './lib/skillSearchDigest'
 import { hashSkillFiles } from './lib/skills'
 
 const DEFAULT_BATCH_SIZE = 50
@@ -1630,6 +1631,43 @@ export const backfillIsSuspiciousInternal = internalMutation({
     }
 
     return { patched, isDone, scanned: page.length }
+  },
+})
+
+// Backfill skillSearchDigest from existing skills.
+// Run once after deploying the schema change:
+//   npx convex run maintenance:backfillSkillSearchDigestInternal --prod
+export const backfillSkillSearchDigestInternal = internalMutation({
+  args: {
+    cursor: v.optional(v.string()),
+    batchSize: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const batchSize = clampInt(args.batchSize ?? 200, 10, 500)
+    const { page, continueCursor, isDone } = await ctx.db
+      .query('skills')
+      .paginate({ cursor: args.cursor ?? null, numItems: batchSize })
+
+    let inserted = 0
+    for (const skill of page) {
+      const existing = await ctx.db
+        .query('skillSearchDigest')
+        .withIndex('by_skill', (q) => q.eq('skillId', skill._id))
+        .unique()
+      if (!existing) {
+        await ctx.db.insert('skillSearchDigest', extractDigestFields(skill))
+        inserted++
+      }
+    }
+
+    if (!isDone) {
+      await ctx.scheduler.runAfter(0, internal.maintenance.backfillSkillSearchDigestInternal, {
+        cursor: continueCursor,
+        batchSize: args.batchSize,
+      })
+    }
+
+    return { inserted, isDone, scanned: page.length }
   },
 })
 

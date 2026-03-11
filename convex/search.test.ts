@@ -46,10 +46,10 @@ describe('search helpers', () => {
         owner: null,
       },
     ]
+    // With incremental hydration, empty vector results skip the hydrate call entirely.
     const runQuery = vi
       .fn()
-      .mockResolvedValueOnce([]) // hydrateResults
-      .mockResolvedValueOnce(fallback) // lexicalFallbackSkills
+      .mockResolvedValueOnce(fallback) // lexicalFallbackSkills (only call)
 
     const result = await searchSkillsHandler(
       {
@@ -61,7 +61,7 @@ describe('search helpers', () => {
 
     expect(result).toHaveLength(1)
     expect(result[0].skill.slug).toBe('orf')
-    expect(runQuery).toHaveBeenLastCalledWith(
+    expect(runQuery).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ query: 'orf', queryTokens: ['orf'] }),
     )
@@ -324,6 +324,159 @@ describe('search helpers', () => {
       1000,
     )
     expect(highDownloads).toBeGreaterThan(lowDownloads)
+  })
+
+  it('uses digest doc instead of full skill doc in hydrateResults', async () => {
+    const digestDoc = {
+      _id: 'skillSearchDigest:d1',
+      _creationTime: 1,
+      skillId: 'skills:1',
+      slug: 'digest-skill',
+      displayName: 'Digest Skill',
+      summary: 'A skill loaded from digest',
+      ownerUserId: 'users:owner',
+      canonicalSkillId: undefined,
+      forkOf: undefined,
+      latestVersionId: 'skillVersions:1',
+      tags: {},
+      badges: {},
+      stats: { downloads: 10, installsCurrent: 0, installsAllTime: 0, stars: 0, versions: 1, comments: 0 },
+      statsDownloads: 10,
+      statsStars: 0,
+      statsInstallsCurrent: 0,
+      statsInstallsAllTime: 0,
+      softDeletedAt: undefined,
+      moderationStatus: 'active',
+      moderationFlags: [],
+      moderationReason: undefined,
+      isSuspicious: false,
+      createdAt: 1,
+      updatedAt: 1,
+    }
+
+    const result = await hydrateResultsHandler(
+      {
+        db: {
+          get: vi.fn(async (id: string) => {
+            if (id === 'users:owner') return { _id: 'users:owner', handle: 'owner' }
+            // Should NOT be called for skills:1 when digest exists
+            if (id === 'skills:1') throw new Error('Should not read full skill doc')
+            return null
+          }),
+          query: vi.fn((table: string) => ({
+            withIndex: (index: string) => ({
+              unique: vi.fn(async () => {
+                if (table === 'embeddingSkillMap' && index === 'by_embedding') {
+                  return { embeddingId: 'skillEmbeddings:1', skillId: 'skills:1' }
+                }
+                if (table === 'skillSearchDigest' && index === 'by_skill') {
+                  return digestDoc
+                }
+                return null
+              }),
+            }),
+          })),
+        },
+      },
+      { embeddingIds: ['skillEmbeddings:1'] },
+    )
+
+    expect(result).toHaveLength(1)
+    expect(result[0].skill.slug).toBe('digest-skill')
+    expect(result[0].skill._id).toBe('skills:1')
+  })
+
+  it('falls back to full skill doc when digest is missing', async () => {
+    const result = await hydrateResultsHandler(
+      {
+        db: {
+          get: vi.fn(async (id: string) => {
+            if (id === 'users:owner') return { _id: 'users:owner', handle: 'owner' }
+            if (id === 'skills:1') {
+              return makeSkillDoc({
+                id: 'skills:1',
+                slug: 'fallback-skill',
+                displayName: 'Fallback Skill',
+              })
+            }
+            return null
+          }),
+          query: vi.fn((table: string) => ({
+            withIndex: (index: string) => ({
+              unique: vi.fn(async () => {
+                if (table === 'embeddingSkillMap' && index === 'by_embedding') {
+                  return { embeddingId: 'skillEmbeddings:1', skillId: 'skills:1' }
+                }
+                // No digest exists — return null
+                return null
+              }),
+            }),
+          })),
+        },
+      },
+      { embeddingIds: ['skillEmbeddings:1'] },
+    )
+
+    expect(result).toHaveLength(1)
+    expect(result[0].skill.slug).toBe('fallback-skill')
+  })
+
+  it('only hydrates new embedding IDs on subsequent iterations (incremental)', async () => {
+    generateEmbeddingMock.mockResolvedValueOnce([0, 1, 2])
+
+    // limit=10 → candidateLimit starts at 50, maxCandidate=200.
+    // First iteration must return exactly candidateLimit (50) to trigger expansion.
+    const firstBatch = Array.from({ length: 50 }, (_, i) => ({
+      _id: `skillEmbeddings:e${i}`,
+      _score: 0.5 - i * 0.001,
+    }))
+    // Second iteration returns 60 results (50 old + 10 new).
+    // 60 < next candidateLimit (100), so the loop breaks.
+    const secondBatch = [
+      ...firstBatch,
+      ...Array.from({ length: 10 }, (_, i) => ({
+        _id: `skillEmbeddings:n${i}`,
+        _score: 0.3 - i * 0.001,
+      })),
+    ]
+
+    const vectorSearchMock = vi
+      .fn()
+      .mockResolvedValueOnce(firstBatch)
+      .mockResolvedValueOnce(secondBatch)
+
+    const hydrateCalls: string[][] = []
+    const runQuery = vi.fn(async (_ref: unknown, args: { embeddingIds?: string[]; query?: string }) => {
+      if (args.embeddingIds) {
+        hydrateCalls.push(args.embeddingIds)
+        return args.embeddingIds.map((embeddingId: string) => ({
+          embeddingId,
+          skill: makePublicSkill({
+            id: `skills:${embeddingId.split(':')[1]}`,
+            slug: `skill-${embeddingId.split(':')[1]}`,
+            displayName: `Skill ${embeddingId.split(':')[1]}`,
+          }),
+          version: null,
+          ownerHandle: 'owner',
+          owner: null,
+        }))
+      }
+      return [] // lexicalFallbackSkills
+    })
+
+    await searchSkillsHandler(
+      { vectorSearch: vectorSearchMock, runQuery },
+      { query: 'test', limit: 10 },
+    )
+
+    // Should have been called twice, but second call should only have new IDs
+    expect(hydrateCalls).toHaveLength(2)
+    expect(hydrateCalls[0]).toHaveLength(50)
+    expect(hydrateCalls[1]).toHaveLength(10)
+    // Verify no overlap between the two hydrate calls
+    const firstSet = new Set(hydrateCalls[0])
+    const overlap = hydrateCalls[1].filter((id) => firstSet.has(id))
+    expect(overlap).toHaveLength(0)
   })
 
   it('merges fallback matches without duplicate skill ids', () => {

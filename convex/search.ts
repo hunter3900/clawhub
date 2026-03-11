@@ -140,10 +140,19 @@ export const searchSkills: ReturnType<typeof action> = action({
         filter: (q) => q.or(q.eq('visibility', 'latest'), q.eq('visibility', 'latest-approved')),
       })
 
-      hydrated = (await ctx.runQuery(internal.search.hydrateResults, {
-        embeddingIds: results.map((result) => result._id),
-        nonSuspiciousOnly: args.nonSuspiciousOnly,
-      })) as SkillSearchEntry[]
+      // Only hydrate embedding IDs we haven't seen yet (incremental).
+      const previousIds = new Set(hydrated.map((e) => e.embeddingId))
+      const newEmbeddingIds = results
+        .map((r) => r._id)
+        .filter((id) => !previousIds.has(id))
+
+      if (newEmbeddingIds.length > 0) {
+        const newEntries = (await ctx.runQuery(internal.search.hydrateResults, {
+          embeddingIds: newEmbeddingIds,
+          nonSuspiciousOnly: args.nonSuspiciousOnly,
+        })) as SkillSearchEntry[]
+        hydrated = [...hydrated, ...newEntries]
+      }
 
       scoreById = new Map<Id<'skillEmbeddings'>, number>(
         results.map((result) => [result._id, result._score]),
@@ -225,7 +234,14 @@ export const hydrateResults = internalQuery({
           ? lookup.skillId
           : await ctx.db.get(embeddingId).then((e) => e?.skillId)
         if (!skillId) return null
-        const skill = await ctx.db.get(skillId)
+        // Use lightweight digest (~800 bytes) instead of full skill doc (~3-5KB).
+        const digest = await ctx.db
+          .query('skillSearchDigest')
+          .withIndex('by_skill', (q) => q.eq('skillId', skillId))
+          .unique()
+        const skill = digest
+          ? ({ ...digest, _id: digest.skillId, _creationTime: digest.createdAt } as unknown as Doc<'skills'>)
+          : await ctx.db.get(skillId)
         if (!skill || skill.softDeletedAt) return null
         if (args.nonSuspiciousOnly && isSkillSuspicious(skill)) return null
         const ownerInfo = await getOwnerInfo(skill.ownerUserId)
