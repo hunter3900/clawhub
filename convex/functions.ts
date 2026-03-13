@@ -24,12 +24,13 @@ triggers.register('skills', async (ctx, change) => {
   } else {
     const fields = extractDigestFields(change.newDoc)
     const owner = await ctx.db.get(change.newDoc.ownerUserId)
+    const isOwnerVisible = owner && !owner.deletedAt && !owner.deactivatedAt
     await upsertSkillSearchDigest(ctx, {
       ...fields,
-      ownerHandle: owner?.handle,
-      ownerName: owner?.name,
-      ownerDisplayName: owner?.displayName,
-      ownerImage: owner?.image,
+      ownerHandle: isOwnerVisible ? owner.handle : undefined,
+      ownerName: isOwnerVisible ? owner.name : undefined,
+      ownerDisplayName: isOwnerVisible ? owner.displayName : undefined,
+      ownerImage: isOwnerVisible ? owner.image : undefined,
     })
   }
 })

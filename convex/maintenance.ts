@@ -1690,11 +1690,12 @@ export const backfillDigestOwnerFieldsInternal = internalMutation({
     for (const digest of page) {
       if (digest.ownerHandle !== undefined) continue
       const owner = await ctx.db.get(digest.ownerUserId)
+      const isOwnerVisible = owner && !owner.deletedAt && !owner.deactivatedAt
       await ctx.db.patch(digest._id, {
-        ownerHandle: owner?.handle,
-        ownerName: owner?.name,
-        ownerDisplayName: owner?.displayName,
-        ownerImage: owner?.image,
+        ownerHandle: isOwnerVisible ? owner.handle : undefined,
+        ownerName: isOwnerVisible ? owner.name : undefined,
+        ownerDisplayName: isOwnerVisible ? owner.displayName : undefined,
+        ownerImage: isOwnerVisible ? owner.image : undefined,
       })
       patched++
     }
