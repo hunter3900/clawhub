@@ -126,6 +126,24 @@ describe('skills.listPublicPage', () => {
     expect(result.items[0]?.skill.slug).toBe('clean')
     expect(result.nextCursor).toBeNull()
   })
+
+  it('returns an empty trending page when no cached leaderboard exists yet', async () => {
+    const ctx = makeTrendingCtx({
+      leaderboards: {},
+      skills: [],
+      users: [],
+      versions: [],
+    })
+
+    const result = await listPublicPageHandler(ctx, {
+      sort: 'trending',
+      limit: 10,
+      nonSuspiciousOnly: false,
+    })
+
+    expect(result.items).toEqual([])
+    expect(result.nextCursor).toBeNull()
+  })
 })
 
 function makeCtx({
@@ -198,20 +216,24 @@ function makeTrendingCtx({
               order: vi.fn((dir: string) => {
                 if (dir !== 'desc') throw new Error(`unexpected order ${dir}`)
                 return {
-                  take: vi.fn().mockResolvedValue([
-                    {
-                      kind: requestedKind,
-                      generatedAt: 1,
-                      rangeStartDay: 1,
-                      rangeEndDay: 1,
-                      items: (leaderboards[requestedKind] ?? []).map((skillId, idx) => ({
-                        skillId,
-                        score: 100 - idx,
-                        installs: 10 - idx,
-                        downloads: 20 - idx,
-                      })),
-                    },
-                  ]),
+                  take: vi.fn().mockResolvedValue(
+                    leaderboards[requestedKind] !== undefined
+                      ? [
+                          {
+                            kind: requestedKind,
+                            generatedAt: 1,
+                            rangeStartDay: 1,
+                            rangeEndDay: 1,
+                            items: leaderboards[requestedKind].map((skillId, idx) => ({
+                              skillId,
+                              score: 100 - idx,
+                              installs: 10 - idx,
+                              downloads: 20 - idx,
+                            })),
+                          },
+                        ]
+                      : [],
+                  ),
                 }
               }),
             }
