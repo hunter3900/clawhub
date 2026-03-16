@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type { Id } from '../../convex/_generated/dataModel'
-import { vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { SkillDetailPage } from '../components/SkillDetailPage'
 
 const navigateMock = vi.fn()
@@ -127,6 +127,78 @@ describe('SkillDetailPage', () => {
     expect(await screen.findByRole('heading', { name: 'Weather' })).toBeTruthy()
     expect(screen.getByText(/Get current weather\./i)).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Files' })).toBeTruthy()
+  })
+
+  it('does not refetch readme when SSR data already matches the latest version', async () => {
+    useQueryMock.mockImplementation((_fn: unknown, args: unknown) => {
+      if (args === 'skip') return undefined
+      if (args && typeof args === 'object' && 'skillId' in args) return []
+      return undefined
+    })
+
+    render(
+      <SkillDetailPage
+        slug="weather"
+        initialData={{
+          result: {
+            skill: {
+              _id: skillId,
+              _creationTime: 0,
+              slug: 'weather',
+              displayName: 'Weather',
+              summary: 'Get current weather.',
+              ownerUserId: ownerId,
+              tags: {},
+              badges: {},
+              stats: {
+                stars: 12,
+                downloads: 34,
+                installsCurrent: 5,
+                installsAllTime: 8,
+                versions: 1,
+                comments: 0,
+              },
+              createdAt: 0,
+              updatedAt: 0,
+            },
+            owner: {
+              _id: ownerId,
+              _creationTime: 0,
+              handle: 'steipete',
+              name: 'Peter',
+            },
+            latestVersion: {
+              _id: versionId,
+              _creationTime: 0,
+              skillId,
+              version: '1.0.0',
+              fingerprint: 'abc',
+              changelog: 'Initial release',
+              parsed: { license: 'MIT-0', frontmatter: {} },
+              files: [
+                {
+                  path: 'SKILL.md',
+                  size: 10,
+                  storageId,
+                  sha256: 'abc',
+                  contentType: 'text/markdown',
+                },
+              ],
+              createdBy: ownerId,
+              createdAt: 0,
+            },
+            forkOf: null,
+            canonical: null,
+          },
+          readme: '# Weather',
+          readmeError: null,
+        }}
+      />,
+    )
+
+    expect(await screen.findByRole('heading', { name: 'Weather' })).toBeTruthy()
+    expect(screen.getByText(/Get current weather\./i)).toBeTruthy()
+    expect(getReadmeMock).not.toHaveBeenCalled()
   })
 
   it('shows not found when skill query resolves to null', async () => {
