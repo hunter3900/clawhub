@@ -1,0 +1,146 @@
+import type {
+  PackageCapabilitySummary,
+  PackageCompatibility,
+  PackageVerificationSummary,
+} from "clawhub-schema";
+import { ApiRoutes } from "clawhub-schema";
+import { getRequiredRuntimeEnv } from "./runtimeEnv";
+
+export type PackageListItem = {
+  name: string;
+  displayName: string;
+  family: "skill" | "code-plugin" | "bundle-plugin";
+  runtimeId?: string | null;
+  channel: "official" | "community" | "private";
+  isOfficial: boolean;
+  summary?: string | null;
+  ownerHandle?: string | null;
+  createdAt: number;
+  updatedAt: number;
+  latestVersion?: string | null;
+  capabilityTags?: string[];
+  executesCode?: boolean;
+  verificationTier?: string | null;
+};
+
+export type PackageDetailResponse = {
+  package: {
+    _id?: string;
+    name: string;
+    displayName: string;
+    family: "skill" | "code-plugin" | "bundle-plugin";
+    runtimeId?: string | null;
+    channel: "official" | "community" | "private";
+    isOfficial: boolean;
+    summary?: string | null;
+    latestVersion?: string | null;
+    createdAt: number;
+    updatedAt: number;
+    tags: Record<string, string>;
+    compatibility?: PackageCompatibility | null;
+    capabilities?: PackageCapabilitySummary | null;
+    verification?: PackageVerificationSummary | null;
+  } | null;
+  owner: {
+    handle?: string | null;
+    displayName?: string | null;
+    image?: string | null;
+  } | null;
+};
+
+export type PackageVersionDetail = {
+  package: {
+    name: string;
+    displayName: string;
+    family: "skill" | "code-plugin" | "bundle-plugin";
+  } | null;
+  version: {
+    version: string;
+    createdAt: number;
+    changelog: string;
+    distTags?: string[];
+    files: Array<{
+      path: string;
+      size: number;
+      sha256: string;
+      contentType?: string;
+    }>;
+    compatibility?: PackageCompatibility | null;
+    capabilities?: PackageCapabilitySummary | null;
+    verification?: PackageVerificationSummary | null;
+  } | null;
+};
+
+function packageApiUrl(path: string) {
+  const base = getRequiredRuntimeEnv("VITE_CONVEX_URL");
+  return new URL(path.startsWith("/") ? path : `/${path}`, base);
+}
+
+async function fetchJson<T>(url: URL): Promise<T> {
+  const response = await fetch(url.toString(), {
+    method: "GET",
+    headers: { Accept: "application/json" },
+  });
+  if (!response.ok) throw new Error(await response.text());
+  return (await response.json()) as T;
+}
+
+export async function fetchPackages(params: {
+  q?: string;
+  family?: "skill" | "code-plugin" | "bundle-plugin";
+  isOfficial?: boolean;
+  executesCode?: boolean;
+  capabilityTag?: string;
+  limit?: number;
+}) {
+  if (params.q?.trim()) {
+    const url = packageApiUrl(`${ApiRoutes.packages}/search`);
+    url.searchParams.set("q", params.q.trim());
+    if (params.family) url.searchParams.set("family", params.family);
+    if (typeof params.isOfficial === "boolean") {
+      url.searchParams.set("isOfficial", String(params.isOfficial));
+    }
+    return await fetchJson<{ results: Array<{ score: number; package: PackageListItem }> }>(url);
+  }
+
+  const route =
+    params.family === "code-plugin"
+      ? ApiRoutes.codePlugins
+      : params.family === "bundle-plugin"
+        ? ApiRoutes.bundlePlugins
+        : ApiRoutes.packages;
+  const url = packageApiUrl(route);
+  if (typeof params.limit === "number") url.searchParams.set("limit", String(params.limit));
+  if (typeof params.isOfficial === "boolean") {
+    url.searchParams.set("isOfficial", String(params.isOfficial));
+  }
+  if (typeof params.executesCode === "boolean") {
+    url.searchParams.set("executesCode", String(params.executesCode));
+  }
+  if (params.capabilityTag) url.searchParams.set("capabilityTag", params.capabilityTag);
+  return await fetchJson<{ items: PackageListItem[]; nextCursor: string | null }>(url);
+}
+
+export async function fetchPackageDetail(name: string) {
+  const url = packageApiUrl(`${ApiRoutes.packages}/${encodeURIComponent(name)}`);
+  return await fetchJson<PackageDetailResponse>(url);
+}
+
+export async function fetchPackageVersion(name: string, version: string) {
+  const url = packageApiUrl(
+    `${ApiRoutes.packages}/${encodeURIComponent(name)}/versions/${encodeURIComponent(version)}`,
+  );
+  return await fetchJson<PackageVersionDetail>(url);
+}
+
+export async function fetchPackageReadme(name: string, version?: string | null) {
+  const url = packageApiUrl(`${ApiRoutes.packages}/${encodeURIComponent(name)}/file`);
+  url.searchParams.set("path", "README.md");
+  if (version) url.searchParams.set("version", version);
+  const response = await fetch(url.toString(), {
+    method: "GET",
+    headers: { Accept: "text/plain" },
+  });
+  if (!response.ok) return null;
+  return await response.text();
+}

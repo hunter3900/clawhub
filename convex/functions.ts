@@ -10,6 +10,10 @@ import {
   internalAction,
   httpAction,
 } from "./_generated/server";
+import {
+  extractPackageDigestFields,
+  upsertPackageSearchDigest,
+} from "./lib/packageSearchDigest";
 import { extractDigestFields, upsertSkillSearchDigest } from "./lib/skillSearchDigest";
 
 const triggers = new Triggers<DataModel>();
@@ -37,6 +41,24 @@ triggers.register("skills", async (ctx, change) => {
       ownerImage: isOwnerVisible ? owner.image : undefined,
     });
   }
+});
+
+triggers.register("packages", async (ctx, change) => {
+  if (change.operation === "delete") {
+    const existing = await ctx.db
+      .query("packageSearchDigest")
+      .withIndex("by_package", (q) => q.eq("packageId", change.id))
+      .unique();
+    if (existing) await ctx.db.delete(existing._id);
+    return;
+  }
+
+  const fields = extractPackageDigestFields(change.newDoc);
+  const owner = await ctx.db.get(change.newDoc.ownerUserId);
+  await upsertPackageSearchDigest(ctx, {
+    ...fields,
+    ownerHandle: owner && !owner.deletedAt && !owner.deactivatedAt ? (owner.handle ?? "") : "",
+  });
 });
 
 export const mutation = customMutation(rawMutation, customCtx(triggers.wrapDB));

@@ -1,0 +1,432 @@
+import { PackagePublishRequestSchema, parseArk } from "clawhub-schema";
+import { api, internal } from "../_generated/api";
+import type { Doc, Id } from "../_generated/dataModel";
+import type { ActionCtx } from "../_generated/server";
+import { buildDeterministicZip } from "../lib/skillZip";
+import { isTextFile } from "../lib/skills";
+import {
+  MAX_RAW_FILE_BYTES,
+  getPathSegments,
+  json,
+  requireApiTokenUserOrResponse,
+  safeTextFileResponse,
+  text,
+  toOptionalNumber,
+} from "./shared";
+const apiRefs = api as unknown as {
+  packages: {
+    listPublicPage: unknown;
+    publishPackage: unknown;
+    searchPublic: unknown;
+    getByName: unknown;
+    listVersions: unknown;
+    getVersionByName: unknown;
+  };
+};
+const internalRefs = internal as unknown as {
+  packages: {
+    getReleasesByIdsInternal: unknown;
+    getReleaseByPackageAndVersionInternal: unknown;
+    getReleaseByIdInternal: unknown;
+  };
+};
+
+async function runQueryRef<T>(ctx: ActionCtx, ref: unknown, args: unknown): Promise<T> {
+  return (await ctx.runQuery(ref as never, args as never)) as T;
+}
+
+async function runActionRef<T>(ctx: ActionCtx, ref: unknown, args: unknown): Promise<T> {
+  return (await ctx.runAction(ref as never, args as never)) as T;
+}
+
+type PackageListQueryArgs = {
+  family?: "skill" | "code-plugin" | "bundle-plugin";
+  channel?: "official" | "community" | "private";
+  isOfficial?: boolean;
+  executesCode?: boolean;
+  capabilityTag?: string;
+  paginationOpts: { cursor: string | null; numItems: number };
+};
+
+type ReleaseLike = {
+  _id: Id<"packageReleases">;
+  version: string;
+  createdAt: number;
+  changelog: string;
+  distTags?: string[];
+  files: Array<{
+    path: string;
+    size: number;
+    sha256: string;
+    storageId: Id<"_storage">;
+    contentType?: string;
+  }>;
+  compatibility?: Doc<"packageReleases">["compatibility"];
+  capabilities?: Doc<"packageReleases">["capabilities"];
+  verification?: Doc<"packageReleases">["verification"];
+  integritySha256?: string;
+};
+
+async function resolvePackageTags(
+  ctx: ActionCtx,
+  tags: Record<string, Id<"packageReleases">>,
+): Promise<Record<string, string>> {
+  const releaseIds = Object.values(tags);
+  if (releaseIds.length === 0) return {};
+  const releases = await runQueryRef<ReleaseLike[]>(
+    ctx,
+    internalRefs.packages.getReleasesByIdsInternal,
+    {
+    releaseIds,
+    },
+  );
+  const byId = new Map(releases.map((release) => [release._id, release.version]));
+  return Object.fromEntries(
+    Object.entries(tags)
+      .map(([tag, releaseId]) => [tag, byId.get(releaseId)])
+      .filter((entry): entry is [string, string] => Boolean(entry[1])),
+  );
+}
+
+function parsePackagePublishBody(body: unknown) {
+  const parsed = parseArk(PackagePublishRequestSchema, body, "Package publish payload") as {
+    name: string;
+    displayName?: string;
+    family: "skill" | "code-plugin" | "bundle-plugin";
+    version: string;
+    changelog: string;
+    channel?: "official" | "community" | "private";
+    tags?: string[];
+    source?: Record<string, unknown>;
+    bundle?: Record<string, unknown>;
+    files: Array<{
+      path: string;
+      size: number;
+      storageId: string;
+      sha256: string;
+      contentType?: string;
+    }>;
+  };
+  if (parsed.files.length === 0) throw new Error("files required");
+  return {
+    name: parsed.name,
+    displayName: parsed.displayName ?? undefined,
+    family: parsed.family,
+    version: parsed.version,
+    changelog: parsed.changelog,
+    channel: parsed.channel ?? undefined,
+    tags: parsed.tags?.filter(Boolean) ?? undefined,
+    source: parsed.source ?? undefined,
+    bundle: parsed.bundle ?? undefined,
+    files: parsed.files.map((file) => ({
+      ...file,
+      storageId: file.storageId as Id<"_storage">,
+    })),
+  };
+}
+
+async function parseMultipartPackagePublish(ctx: ActionCtx, request: Request) {
+  const form = await request.formData();
+  const payloadRaw = form.get("payload");
+  if (!payloadRaw || typeof payloadRaw !== "string") throw new Error("Missing payload");
+  const payload = JSON.parse(payloadRaw) as Record<string, unknown>;
+  const files: Array<{
+    path: string;
+    size: number;
+    storageId: Id<"_storage">;
+    sha256: string;
+    contentType?: string;
+  }> = [];
+  for (const entry of form.getAll("files")) {
+    if (typeof entry === "string") continue;
+    const buffer = new Uint8Array(await entry.arrayBuffer());
+    const digest = await crypto.subtle.digest("SHA-256", buffer);
+    const sha256 = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+    const storageId = await ctx.storage.store(entry);
+    files.push({
+      path: entry.name,
+      size: entry.size,
+      storageId,
+      sha256,
+      contentType: entry.type || undefined,
+    });
+  }
+  return parsePackagePublishBody({ ...payload, files });
+}
+
+async function listPackages(ctx: ActionCtx, request: Request, family?: PackageListQueryArgs["family"]) {
+  const limit = Math.max(1, Math.min(toOptionalNumber(new URL(request.url).searchParams.get("limit")) ?? 25, 100));
+  const cursor = new URL(request.url).searchParams.get("cursor");
+  const channelRaw = new URL(request.url).searchParams.get("channel")?.trim();
+  const capabilityTag = new URL(request.url).searchParams.get("capabilityTag")?.trim() || undefined;
+  const isOfficialRaw = new URL(request.url).searchParams.get("isOfficial");
+  const executesCodeRaw = new URL(request.url).searchParams.get("executesCode");
+  const result = await runQueryRef<{
+    page: unknown[];
+    isDone: boolean;
+    continueCursor: string | null;
+  }>(ctx, apiRefs.packages.listPublicPage, {
+    family,
+    channel:
+      channelRaw === "official" || channelRaw === "community" || channelRaw === "private"
+        ? channelRaw
+        : undefined,
+    isOfficial:
+      isOfficialRaw === "true" ? true : isOfficialRaw === "false" ? false : undefined,
+    executesCode:
+      executesCodeRaw === "true" ? true : executesCodeRaw === "false" ? false : undefined,
+    capabilityTag,
+    paginationOpts: { cursor, numItems: limit },
+  } satisfies PackageListQueryArgs);
+  return json({ items: result.page, nextCursor: result.isDone ? null : result.continueCursor });
+}
+
+export async function listPackagesV1Handler(ctx: ActionCtx, request: Request) {
+  return await listPackages(ctx, request);
+}
+
+export async function listCodePluginsV1Handler(ctx: ActionCtx, request: Request) {
+  return await listPackages(ctx, request, "code-plugin");
+}
+
+export async function listBundlePluginsV1Handler(ctx: ActionCtx, request: Request) {
+  return await listPackages(ctx, request, "bundle-plugin");
+}
+
+export async function publishPackageV1Handler(ctx: ActionCtx, request: Request) {
+  const auth = await requireApiTokenUserOrResponse(ctx, request, {});
+  if (!auth.ok) return auth.response;
+
+  try {
+    const contentType = request.headers.get("content-type") ?? "";
+    const payload = contentType.includes("multipart/form-data")
+      ? await parseMultipartPackagePublish(ctx, request)
+      : parsePackagePublishBody(await request.json());
+    const result = await runActionRef(ctx, apiRefs.packages.publishPackage, {
+      userId: auth.userId,
+      payload,
+    });
+    return json(result);
+  } catch (error) {
+    return text(error instanceof Error ? error.message : "Publish failed", 400);
+  }
+}
+
+async function getReleaseForRequest(
+  ctx: ActionCtx,
+  pkg: Pick<PublicPackageDocLike, "_id" | "tags" | "latestReleaseId">,
+  request: Request,
+): Promise<ReleaseLike | null> {
+  const url = new URL(request.url);
+  const versionParam = url.searchParams.get("version")?.trim();
+  const tagParam = url.searchParams.get("tag")?.trim();
+
+  if (versionParam) {
+    return await runQueryRef<ReleaseLike | null>(
+      ctx,
+      internalRefs.packages.getReleaseByPackageAndVersionInternal,
+      {
+      packageId: pkg._id,
+      version: versionParam,
+      },
+    );
+  }
+  if (tagParam) {
+    const releaseId = pkg.tags[tagParam];
+    if (!releaseId) return null;
+    return await runQueryRef<ReleaseLike | null>(ctx, internalRefs.packages.getReleaseByIdInternal, {
+      releaseId,
+    });
+  }
+  if (!pkg.latestReleaseId) return null;
+  return await runQueryRef<ReleaseLike | null>(ctx, internalRefs.packages.getReleaseByIdInternal, {
+    releaseId: pkg.latestReleaseId,
+  });
+}
+
+export async function packagesGetRouterV1Handler(ctx: ActionCtx, request: Request) {
+  const segments = getPathSegments(request, "/api/v1/packages/");
+  if (segments.length === 0) return text("Not found", 404);
+
+  if (segments[0] === "search") {
+    const url = new URL(request.url);
+    const queryText = url.searchParams.get("q")?.trim() ?? "";
+    const limit = Math.max(1, Math.min(toOptionalNumber(url.searchParams.get("limit")) ?? 20, 100));
+    const familyRaw = url.searchParams.get("family");
+    const channelRaw = url.searchParams.get("channel");
+    const isOfficialRaw = url.searchParams.get("isOfficial");
+    const results = await runQueryRef(ctx, apiRefs.packages.searchPublic, {
+      query: queryText,
+      limit,
+      family:
+        familyRaw === "skill" || familyRaw === "code-plugin" || familyRaw === "bundle-plugin"
+          ? familyRaw
+          : undefined,
+      channel:
+        channelRaw === "official" || channelRaw === "community" || channelRaw === "private"
+          ? channelRaw
+          : undefined,
+      isOfficial:
+        isOfficialRaw === "true" ? true : isOfficialRaw === "false" ? false : undefined,
+    });
+    return json({ results });
+  }
+
+  const packageName = segments[0] ?? "";
+  const detail = (await runQueryRef(
+    ctx,
+    apiRefs.packages.getByName,
+    {
+    name: packageName,
+    },
+  )) as
+    | {
+        package: PublicPackageDocLike | null;
+        latestRelease: ReleaseLike | null;
+        owner: { handle?: string; displayName?: string; image?: string } | null;
+      }
+    | null;
+
+  if (!detail?.package) return text("Package not found", 404);
+
+  if (segments.length === 1) {
+    return json({
+      package: {
+        ...detail.package,
+        tags: await resolvePackageTags(ctx, detail.package.tags),
+      },
+      owner: detail.owner
+        ? {
+            handle: detail.owner.handle ?? null,
+            displayName: detail.owner.displayName ?? null,
+            image: detail.owner.image ?? null,
+          }
+        : null,
+    });
+  }
+
+  if (segments[1] === "versions" && segments.length === 2) {
+    const limit = Math.max(1, Math.min(toOptionalNumber(new URL(request.url).searchParams.get("limit")) ?? 25, 100));
+    const cursor = new URL(request.url).searchParams.get("cursor");
+    const result = await runQueryRef<{
+      page: ReleaseLike[];
+      isDone: boolean;
+      continueCursor: string | null;
+    }>(ctx, apiRefs.packages.listVersions, {
+      name: packageName,
+      paginationOpts: { cursor, numItems: limit },
+    });
+    return json({
+      items: result.page.map((release: ReleaseLike) => ({
+        version: release.version,
+        createdAt: release.createdAt,
+        changelog: release.changelog,
+        distTags: release.distTags ?? [],
+      })),
+      nextCursor: result.isDone ? null : result.continueCursor,
+    });
+  }
+
+  if (segments[1] === "versions" && segments[2]) {
+    const result = (await runQueryRef(
+      ctx,
+      apiRefs.packages.getVersionByName,
+      {
+      name: packageName,
+      version: segments[2],
+      },
+    )) as { package: PublicPackageDocLike; version: ReleaseLike } | null;
+    if (!result) return text("Version not found", 404);
+    return json({
+      package: {
+        name: result.package.name,
+        displayName: result.package.displayName,
+        family: result.package.family,
+      },
+      version: {
+        version: result.version.version,
+        createdAt: result.version.createdAt,
+        changelog: result.version.changelog,
+        distTags: result.version.distTags ?? [],
+        files: result.version.files.map((file) => ({
+          path: file.path,
+          size: file.size,
+          sha256: file.sha256,
+          contentType: file.contentType,
+        })),
+        compatibility: result.version.compatibility ?? null,
+        capabilities: result.version.capabilities ?? null,
+        verification: result.version.verification ?? null,
+      },
+    });
+  }
+
+  if (segments[1] === "file") {
+    const path = new URL(request.url).searchParams.get("path")?.trim();
+    if (!path) return text("Missing path", 400);
+    const release = await getReleaseForRequest(ctx, detail.package, request);
+    if (!release) return text("Version not found", 404);
+    const file = release.files.find((entry) => entry.path === path);
+    if (!file) return text("File not found", 404);
+    if (!isTextFile(file.path, file.contentType)) return text("Binary files are not served inline", 415);
+    if (file.size > MAX_RAW_FILE_BYTES) return text("File too large", 413);
+    const blob = await ctx.storage.get(file.storageId);
+    if (!blob) return text("File not found", 404);
+    const textContent = await blob.text();
+    return safeTextFileResponse({
+      textContent,
+      path: file.path,
+      contentType: file.contentType,
+      sha256: file.sha256,
+      size: file.size,
+    });
+  }
+
+  if (segments[1] === "download") {
+    const release = await getReleaseForRequest(ctx, detail.package, request);
+    if (!release) return text("Version not found", 404);
+    const entries: Array<{ path: string; bytes: Uint8Array }> = [];
+    for (const file of release.files) {
+      const blob = await ctx.storage.get(file.storageId);
+      if (!blob) continue;
+      entries.push({
+        path: file.path,
+        bytes: new Uint8Array(await blob.arrayBuffer()),
+      });
+    }
+    const zip = buildDeterministicZip(entries, {
+      ownerId: String(detail.package._id),
+      slug: detail.package.name.replaceAll("/", "-"),
+      version: release.version,
+      publishedAt: release.createdAt,
+    });
+    return new Response(new Blob([zip], { type: "application/zip" }), {
+      status: 200,
+      headers: {
+        "Content-Type": "application/zip",
+        "Content-Disposition": `attachment; filename="${detail.package.name.replaceAll("/", "-")}-${release.version}.zip"`,
+      },
+    });
+  }
+
+  return text("Not found", 404);
+}
+
+type PublicPackageDocLike = {
+  _id: Id<"packages">;
+  name: string;
+  displayName: string;
+  family: "skill" | "code-plugin" | "bundle-plugin";
+  tags: Record<string, Id<"packageReleases">>;
+  latestReleaseId?: Id<"packageReleases">;
+  channel: "official" | "community" | "private";
+  isOfficial: boolean;
+  runtimeId?: string;
+  summary?: string;
+  latestVersion?: string | null;
+  compatibility?: Doc<"packages">["compatibility"];
+  capabilities?: Doc<"packages">["capabilities"];
+  verification?: Doc<"packages">["verification"];
+  createdAt: number;
+  updatedAt: number;
+};
