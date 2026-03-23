@@ -46,13 +46,16 @@ const internalRefs = internal as unknown as {
   };
   packages: {
     backfillPackageReleaseScansInternal: unknown;
+    scanPackageReleaseStaticallyInternal: unknown;
     insertReleaseInternal: unknown;
     getByNameForViewerInternal: unknown;
     getPackageByIdInternal: unknown;
+    getReleaseByIdInternal: unknown;
     getPackageReleaseScanBackfillBatchInternal: unknown;
     listVersionsForViewerInternal: unknown;
     getVersionByNameForViewerInternal: unknown;
     publishPackageForUserInternal: unknown;
+    updateReleaseStaticScanInternal: unknown;
   };
   skills: {
     getSkillBySlugInternal: unknown;
@@ -1261,6 +1264,7 @@ export const getPackageReleaseScanBackfillBatchInternal = internalQuery({
       packageId: Id<"packages">;
       needsVt: boolean;
       needsLlm: boolean;
+      needsStatic: boolean;
     }> = [];
     let nextCursor = cursor;
 
@@ -1274,13 +1278,15 @@ export const getPackageReleaseScanBackfillBatchInternal = internalQuery({
 
       const needsVt = !release.sha256hash || !release.vtAnalysis;
       const needsLlm = !release.llmAnalysis || release.llmAnalysis.status === "error";
-      if (!needsVt && !needsLlm) continue;
+      const needsStatic = !release.staticScan;
+      if (!needsVt && !needsLlm && !needsStatic) continue;
 
       results.push({
         releaseId: release._id,
         packageId: release.packageId,
         needsVt,
         needsLlm,
+        needsStatic,
       });
     }
 
@@ -1813,6 +1819,105 @@ export const updateReleaseLlmAnalysisInternal = internalMutation({
   },
 });
 
+export const updateReleaseStaticScanInternal = internalMutation({
+  args: {
+    releaseId: v.id("packageReleases"),
+    staticScan: v.object({
+      status: v.union(v.literal("clean"), v.literal("suspicious"), v.literal("malicious")),
+      reasonCodes: v.array(v.string()),
+      findings: v.array(
+        v.object({
+          code: v.string(),
+          severity: v.union(v.literal("info"), v.literal("warn"), v.literal("critical")),
+          file: v.string(),
+          line: v.number(),
+          message: v.string(),
+          evidence: v.string(),
+        }),
+      ),
+      summary: v.string(),
+      engineVersion: v.string(),
+      checkedAt: v.number(),
+    }),
+  },
+  handler: async (ctx, args) => {
+    const release = await ctx.db.get(args.releaseId);
+    if (!release || release.softDeletedAt) return;
+    const activeRelease = release;
+
+    const patch: Partial<Doc<"packageReleases">> = {
+      staticScan: args.staticScan,
+    };
+    if (args.staticScan.status === "malicious") {
+      patch.verification = activeRelease.verification
+        ? {
+            ...activeRelease.verification,
+            scanStatus: "malicious",
+          }
+        : activeRelease.verification;
+    }
+
+    await ctx.db.patch(args.releaseId, patch);
+
+    if (args.staticScan.status === "malicious") {
+      await syncLatestPackageVerification(
+        ctx,
+        { ...activeRelease, ...patch } as Doc<"packageReleases">,
+        "malicious",
+      );
+    }
+  },
+});
+
+export const scanPackageReleaseStaticallyInternal = internalAction({
+  args: {
+    releaseId: v.id("packageReleases"),
+  },
+  handler: async (ctx, args) => {
+    const release = await runQueryRef<Doc<"packageReleases"> | null>(
+      ctx,
+      internalRefs.packages.getReleaseByIdInternal,
+      { releaseId: args.releaseId },
+    );
+    if (!release || release.softDeletedAt) {
+      return { ok: true as const, skipped: "missing_release" as const };
+    }
+    const activeRelease = release;
+
+    const pkg = await runQueryRef<Doc<"packages"> | null>(
+      ctx,
+      internalRefs.packages.getPackageByIdInternal,
+      { packageId: activeRelease.packageId },
+    );
+    if (!pkg || pkg.softDeletedAt || pkg.family === "skill") {
+      return { ok: true as const, skipped: "missing_package" as const };
+    }
+
+    const staticScan = await runStaticPublishScan(ctx, {
+      slug: pkg.name,
+      displayName: pkg.displayName,
+      summary: pkg.summary,
+      metadata: {
+        packageJson: activeRelease.extractedPackageJson,
+        pluginManifest: activeRelease.extractedPluginManifest,
+        bundleManifest: activeRelease.normalizedBundleManifest,
+        source: activeRelease.source,
+      },
+      files: activeRelease.files,
+    });
+
+    await runMutationRef(ctx, internalRefs.packages.updateReleaseStaticScanInternal, {
+      releaseId: args.releaseId,
+      staticScan,
+    });
+
+    return {
+      ok: true as const,
+      status: staticScan.status,
+    };
+  },
+});
+
 export const backfillPackageReleaseScansInternal = internalAction({
   args: {
     cursor: v.optional(v.number()),
@@ -1829,6 +1934,7 @@ export const backfillPackageReleaseScansInternal = internalAction({
         releaseId: Id<"packageReleases">;
         needsVt: boolean;
         needsLlm: boolean;
+        needsStatic: boolean;
       }>;
       nextCursor: number;
       done: boolean;
@@ -1844,6 +1950,11 @@ export const backfillPackageReleaseScansInternal = internalAction({
       }
       if (release.needsLlm) {
         await runAfterRef(ctx, 0, internalRefs.llmEval.evaluatePackageReleaseWithLlm, {
+          releaseId: release.releaseId,
+        });
+      }
+      if (release.needsStatic) {
+        await runAfterRef(ctx, 0, internalRefs.packages.scanPackageReleaseStaticallyInternal, {
           releaseId: release.releaseId,
         });
       }

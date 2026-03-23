@@ -3,6 +3,8 @@
 import { getAuthUserId } from "@convex-dev/auth/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  backfillPackageReleaseScansInternal,
+  getPackageReleaseScanBackfillBatchInternal,
   getByName,
   list,
   publishPackage,
@@ -12,6 +14,7 @@ import {
   listPublicPage,
   listPageForViewerInternal,
   listVersions,
+  updateReleaseStaticScanInternal,
   softDeletePackageInternal,
   searchForViewerInternal,
   searchPublic,
@@ -169,6 +172,58 @@ const publishPackageForUserInternalHandler = (
     {
       actorUserId: string;
       payload: unknown;
+    },
+    unknown
+  >
+)._handler;
+const getPackageReleaseScanBackfillBatchInternalHandler = (
+  getPackageReleaseScanBackfillBatchInternal as unknown as WrappedHandler<
+    {
+      cursor?: number;
+      batchSize?: number;
+    },
+    {
+      releases: Array<{
+        releaseId: string;
+        packageId: string;
+        needsVt: boolean;
+        needsLlm: boolean;
+        needsStatic: boolean;
+      }>;
+      nextCursor: number;
+      done: boolean;
+    }
+  >
+)._handler;
+const backfillPackageReleaseScansInternalHandler = (
+  backfillPackageReleaseScansInternal as unknown as WrappedHandler<
+    {
+      cursor?: number;
+      batchSize?: number;
+      scheduled?: number;
+    },
+    { scheduled: number; nextCursor: number; done: boolean }
+  >
+)._handler;
+const updateReleaseStaticScanInternalHandler = (
+  updateReleaseStaticScanInternal as unknown as WrappedHandler<
+    {
+      releaseId: string;
+      staticScan: {
+        status: "clean" | "suspicious" | "malicious";
+        reasonCodes: string[];
+        findings: Array<{
+          code: string;
+          severity: string;
+          file: string;
+          line: number;
+          message: string;
+          evidence: string;
+        }>;
+        summary: string;
+        engineVersion: string;
+        checkedAt: number;
+      };
     },
     unknown
   >
@@ -1993,5 +2048,182 @@ describe("packages public queries", () => {
         },
       }),
     ).rejects.toThrow("Unauthorized");
+  });
+});
+
+describe("package scan backfill", () => {
+  it("includes releases missing static scan in the backfill batch", async () => {
+    const result = await getPackageReleaseScanBackfillBatchInternalHandler(
+      {
+        db: {
+          query: vi.fn((table: string) => {
+            if (table !== "packageReleases") throw new Error(`Unexpected table ${table}`);
+            return {
+              withIndex: vi.fn(() => ({
+                order: vi.fn(() => ({
+                  take: vi.fn().mockResolvedValue([
+                    {
+                      _id: "packageReleases:missing-static",
+                      _creationTime: 10,
+                      packageId: "packages:demo",
+                      sha256hash: "hash",
+                      vtAnalysis: { status: "clean" },
+                      llmAnalysis: { status: "clean" },
+                      staticScan: undefined,
+                    },
+                    {
+                      _id: "packageReleases:fully-scanned",
+                      _creationTime: 11,
+                      packageId: "packages:demo",
+                      sha256hash: "hash",
+                      vtAnalysis: { status: "clean" },
+                      llmAnalysis: { status: "clean" },
+                      staticScan: { status: "clean" },
+                    },
+                  ]),
+                })),
+              })),
+            };
+          }),
+          get: vi.fn(async (id: string) => {
+            if (id === "packages:demo") return makePackageDoc();
+            return null;
+          }),
+        },
+      } as never,
+      { batchSize: 10 },
+    );
+
+    expect(result.releases).toEqual([
+      {
+        releaseId: "packageReleases:missing-static",
+        packageId: "packages:demo",
+        needsVt: false,
+        needsLlm: false,
+        needsStatic: true,
+      },
+    ]);
+  });
+
+  it("schedules static rescans for releases missing only static scan data", async () => {
+    const originalVtApiKey = process.env.VT_API_KEY;
+    process.env.VT_API_KEY = "vt-test-key";
+
+    try {
+      const runAfter = vi.fn().mockResolvedValue(undefined);
+      const result = await backfillPackageReleaseScansInternalHandler(
+        {
+          runQuery: vi.fn().mockResolvedValue({
+            releases: [
+              {
+                releaseId: "packageReleases:static-only",
+                needsVt: false,
+                needsLlm: false,
+                needsStatic: true,
+              },
+            ],
+            nextCursor: 123,
+            done: true,
+          }),
+          scheduler: { runAfter },
+        } as never,
+        { batchSize: 10 },
+      );
+
+      expect(result).toEqual({ scheduled: 1, nextCursor: 123, done: true });
+      expect(runAfter).toHaveBeenCalledTimes(1);
+      expect(runAfter).toHaveBeenCalledWith(
+        0,
+        expect.anything(),
+        expect.objectContaining({ releaseId: "packageReleases:static-only" }),
+      );
+    } finally {
+      if (originalVtApiKey === undefined) {
+        delete process.env.VT_API_KEY;
+      } else {
+        process.env.VT_API_KEY = originalVtApiKey;
+      }
+    }
+  });
+
+  it("promotes latest package scan status when a static rescan finds malware", async () => {
+    const patch = vi.fn().mockResolvedValue(undefined);
+    const release = {
+      _id: "packageReleases:demo-1",
+      packageId: "packages:demo",
+      verification: {
+        tier: "source-linked",
+        scope: "artifact-only",
+        scanStatus: "pending",
+      },
+      softDeletedAt: undefined,
+    };
+    const pkg = {
+      ...makePackageDoc(),
+      _id: "packages:demo",
+      latestReleaseId: "packageReleases:demo-1",
+      verification: {
+        tier: "source-linked",
+        scope: "artifact-only",
+        scanStatus: "pending",
+      },
+      latestVersionSummary: {
+        version: "1.0.0",
+        verification: {
+          tier: "source-linked",
+          scope: "artifact-only",
+          scanStatus: "pending",
+        },
+      },
+    };
+
+    await updateReleaseStaticScanInternalHandler(
+      {
+        db: {
+          get: vi.fn(async (id: string) => {
+            if (id === "packageReleases:demo-1") return release;
+            if (id === "packages:demo") return pkg;
+            return null;
+          }),
+          query: vi.fn(),
+          insert: vi.fn(),
+          patch,
+          replace: vi.fn(),
+          delete: vi.fn(),
+          normalizeId: vi.fn(),
+        },
+      } as never,
+      {
+        releaseId: "packageReleases:demo-1",
+        staticScan: {
+          status: "malicious",
+          reasonCodes: ["malware.test"],
+          findings: [],
+          summary: "Malware detected",
+          engineVersion: "test",
+          checkedAt: 1,
+        },
+      },
+    );
+
+    expect(patch).toHaveBeenNthCalledWith(
+      1,
+      "packageReleases:demo-1",
+      expect.objectContaining({
+        staticScan: expect.objectContaining({ status: "malicious" }),
+        verification: expect.objectContaining({ scanStatus: "malicious" }),
+      }),
+    );
+    expect(patch).toHaveBeenNthCalledWith(
+      2,
+      "packages:demo",
+      expect.objectContaining({
+        scanStatus: "malicious",
+        verification: expect.objectContaining({ scanStatus: "malicious" }),
+        latestVersionSummary: expect.objectContaining({
+          verification: expect.objectContaining({ scanStatus: "malicious" }),
+        }),
+      }),
+    );
   });
 });
