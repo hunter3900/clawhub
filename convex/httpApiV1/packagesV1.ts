@@ -445,7 +445,12 @@ async function parseMultipartPackagePublish(ctx: ActionCtx, request: Request) {
   return parsePackagePublishBody({ ...payload, files });
 }
 
-async function listPackages(ctx: ActionCtx, request: Request, family?: PackageListQueryArgs["family"]) {
+async function listPackages(
+  ctx: ActionCtx,
+  request: Request,
+  family?: PackageListQueryArgs["family"],
+  options?: { includeSkills?: boolean },
+) {
   const rate = await applyRateLimit(ctx, request, "read");
   if (!rate.ok) return rate.response;
 
@@ -463,6 +468,7 @@ async function listPackages(ctx: ActionCtx, request: Request, family?: PackageLi
     (familyRaw === "skill" || familyRaw === "code-plugin" || familyRaw === "bundle-plugin"
       ? familyRaw
       : undefined);
+  const includeSkills = options?.includeSkills ?? effectiveFamily === undefined;
   const channel =
     channelRaw === "official" || channelRaw === "community" || channelRaw === "private"
       ? channelRaw
@@ -491,7 +497,7 @@ async function listPackages(ctx: ActionCtx, request: Request, family?: PackageLi
     );
   }
 
-  if (!effectiveFamily) {
+  if (!effectiveFamily && includeSkills) {
     const packageSource = initCatalogSource(decodeUnifiedCatalogCursor(cursor).packages);
     const skillSource = initCatalogSource(decodeUnifiedCatalogCursor(cursor).skills);
     const pageSize = limit;
@@ -588,7 +594,11 @@ async function listPackages(ctx: ActionCtx, request: Request, family?: PackageLi
 }
 
 export async function listPackagesV1Handler(ctx: ActionCtx, request: Request) {
-  return await listPackages(ctx, request);
+  return await listPackages(ctx, request, undefined, { includeSkills: true });
+}
+
+export async function listPluginsV1Handler(ctx: ActionCtx, request: Request) {
+  return await listPackages(ctx, request, undefined, { includeSkills: false });
 }
 
 export async function listCodePluginsV1Handler(ctx: ActionCtx, request: Request) {
@@ -725,96 +735,107 @@ async function getSkillVersionForRequest(
   })) as SkillVersionLike | null;
 }
 
-export async function packagesGetRouterV1Handler(ctx: ActionCtx, request: Request) {
-  const segments = getPathSegments(request, "/api/v1/packages/");
-  if (segments.length === 0) return text("Not found", 404);
-
-  const rateKind = segments[1] === "download" ? "download" : "read";
-  const rate = await applyRateLimit(ctx, request, rateKind);
+async function searchPackages(
+  ctx: ActionCtx,
+  request: Request,
+  options?: { includeSkills?: boolean },
+) {
+  const rate = await applyRateLimit(ctx, request, "read");
   if (!rate.ok) return rate.response;
 
-  if (segments[0] === "search" && new URL(request.url).searchParams.has("q")) {
-    const url = new URL(request.url);
-    const viewerUserId = await getOptionalViewerUserIdForRequest(ctx, request);
-    const queryText = url.searchParams.get("q")?.trim() ?? "";
-    const limit = Math.max(1, Math.min(toOptionalNumber(url.searchParams.get("limit")) ?? 20, 100));
-    const familyRaw = url.searchParams.get("family");
-    const channelRaw = url.searchParams.get("channel");
-    const isOfficialRaw = url.searchParams.get("isOfficial");
-    const executesCodeRaw = url.searchParams.get("executesCode");
-    const capabilityTag = url.searchParams.get("capabilityTag")?.trim() || undefined;
-    const family =
-      familyRaw === "skill" || familyRaw === "code-plugin" || familyRaw === "bundle-plugin"
-        ? familyRaw
-        : undefined;
-    const channel =
-      channelRaw === "official" || channelRaw === "community" || channelRaw === "private"
-        ? channelRaw
-        : undefined;
-    const isOfficial =
-      isOfficialRaw === "true" ? true : isOfficialRaw === "false" ? false : undefined;
-    const executesCode =
-      executesCodeRaw === "true" ? true : executesCodeRaw === "false" ? false : undefined;
+  const url = new URL(request.url);
+  const viewerUserId = await getOptionalViewerUserIdForRequest(ctx, request);
+  const queryText = url.searchParams.get("q")?.trim() ?? "";
+  const limit = Math.max(1, Math.min(toOptionalNumber(url.searchParams.get("limit")) ?? 20, 100));
+  const familyRaw = url.searchParams.get("family");
+  const channelRaw = url.searchParams.get("channel");
+  const isOfficialRaw = url.searchParams.get("isOfficial");
+  const executesCodeRaw = url.searchParams.get("executesCode");
+  const capabilityTag = url.searchParams.get("capabilityTag")?.trim() || undefined;
+  const family =
+    familyRaw === "skill" || familyRaw === "code-plugin" || familyRaw === "bundle-plugin"
+      ? familyRaw
+      : undefined;
+  const includeSkills = options?.includeSkills ?? family === undefined;
+  const channel =
+    channelRaw === "official" || channelRaw === "community" || channelRaw === "private"
+      ? channelRaw
+      : undefined;
+  const isOfficial =
+    isOfficialRaw === "true" ? true : isOfficialRaw === "false" ? false : undefined;
+  const executesCode =
+    executesCodeRaw === "true" ? true : executesCodeRaw === "false" ? false : undefined;
 
-    let results: CatalogSearchEntry[];
-    if (family === "skill") {
-      results = await runQueryRef<CatalogSearchEntry[]>(ctx, apiRefs.skills.searchPackageCatalogPublic, {
+  let results: CatalogSearchEntry[];
+  if (family === "skill") {
+    results = await runQueryRef<CatalogSearchEntry[]>(ctx, apiRefs.skills.searchPackageCatalogPublic, {
+      query: queryText,
+      limit,
+      channel,
+      isOfficial,
+      executesCode,
+      capabilityTag,
+    });
+  } else if (family || !includeSkills) {
+    results = await runQueryRef<CatalogSearchEntry[]>(ctx, internalRefs.packages.searchForViewerInternal, {
+      query: queryText,
+      limit,
+      family,
+      channel,
+      isOfficial,
+      executesCode,
+      capabilityTag,
+      viewerUserId: viewerUserId ?? undefined,
+    });
+  } else {
+    const [packageResults, skillResults] = await Promise.all([
+      runQueryRef<CatalogSearchEntry[]>(ctx, internalRefs.packages.searchForViewerInternal, {
         query: queryText,
         limit,
-        channel,
-        isOfficial,
-        executesCode,
-        capabilityTag,
-      });
-    } else if (family) {
-      results = await runQueryRef<CatalogSearchEntry[]>(ctx, internalRefs.packages.searchForViewerInternal, {
-        query: queryText,
-        limit,
-        family,
         channel,
         isOfficial,
         executesCode,
         capabilityTag,
         viewerUserId: viewerUserId ?? undefined,
-      });
-    } else {
-      const [packageResults, skillResults] = await Promise.all([
-        runQueryRef<CatalogSearchEntry[]>(ctx, internalRefs.packages.searchForViewerInternal, {
-          query: queryText,
-          limit,
-          channel,
-          isOfficial,
-          executesCode,
-          capabilityTag,
-          viewerUserId: viewerUserId ?? undefined,
-        }),
-        runQueryRef<CatalogSearchEntry[]>(ctx, apiRefs.skills.searchPackageCatalogPublic, {
-          query: queryText,
-          limit,
-          channel,
-          isOfficial,
-          executesCode,
-          capabilityTag,
-        }),
-      ]);
-      const seen = new Set<string>();
-      results = [...packageResults, ...skillResults]
-        .filter((entry) => {
-          const key = `${entry.package.family}:${entry.package.name}`;
-          if (seen.has(key)) return false;
-          seen.add(key);
-          return true;
-        })
-        .sort(
-          (a, b) =>
-            b.score - a.score ||
-            Number(b.package.isOfficial) - Number(a.package.isOfficial) ||
-            compareCatalogItems(a.package, b.package),
-        )
-        .slice(0, limit);
-    }
-    return json({ results }, 200, rate.headers);
+      }),
+      runQueryRef<CatalogSearchEntry[]>(ctx, apiRefs.skills.searchPackageCatalogPublic, {
+        query: queryText,
+        limit,
+        channel,
+        isOfficial,
+        executesCode,
+        capabilityTag,
+      }),
+    ]);
+    const seen = new Set<string>();
+    results = [...packageResults, ...skillResults]
+      .filter((entry) => {
+        const key = `${entry.package.family}:${entry.package.name}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .sort(
+        (a, b) =>
+          b.score - a.score ||
+          Number(b.package.isOfficial) - Number(a.package.isOfficial) ||
+          compareCatalogItems(a.package, b.package),
+      )
+      .slice(0, limit);
   }
+  return json({ results }, 200, rate.headers);
+}
+
+export async function packagesGetRouterV1Handler(ctx: ActionCtx, request: Request) {
+  const segments = getPathSegments(request, "/api/v1/packages/");
+  if (segments.length === 0) return text("Not found", 404);
+  if (segments[0] === "search" && new URL(request.url).searchParams.has("q")) {
+    return await searchPackages(ctx, request, { includeSkills: true });
+  }
+
+  const rateKind = segments[1] === "download" ? "download" : "read";
+  const rate = await applyRateLimit(ctx, request, rateKind);
+  if (!rate.ok) return rate.response;
 
   const packageName = segments[0] ?? "";
   const viewerUserId = await getOptionalViewerUserIdForRequest(ctx, request);
@@ -1067,6 +1088,15 @@ export async function packagesGetRouterV1Handler(ctx: ActionCtx, request: Reques
   }
 
   return text("Not found", 404, rate.headers);
+}
+
+export async function pluginsGetRouterV1Handler(ctx: ActionCtx, request: Request) {
+  const segments = getPathSegments(request, "/api/v1/plugins/");
+  if (segments.length === 0) return text("Not found", 404);
+  if (segments[0] === "search" && new URL(request.url).searchParams.has("q")) {
+    return await searchPackages(ctx, request, { includeSkills: false });
+  }
+  return text("Not found", 404);
 }
 
 type PublicPackageDocLike = {

@@ -112,78 +112,10 @@ export type PackageVersionDetail = {
 
 type PluginFamily = "code-plugin" | "bundle-plugin";
 
-type PluginCatalogSourceCursor = {
-  cursor: string | null;
-  offset: number;
-  pageSize: number;
-  done: boolean;
-};
-
-type PluginCatalogCursorState = {
-  code: PluginCatalogSourceCursor;
-  bundle: PluginCatalogSourceCursor;
-};
-
 type PluginCatalogResult = {
   items: PackageListItem[];
   nextCursor: string | null;
 };
-
-const DEFAULT_PLUGIN_SOURCE_CURSOR: PluginCatalogSourceCursor = {
-  cursor: null,
-  offset: 0,
-  pageSize: 0,
-  done: false,
-};
-
-function clonePluginSourceCursor(
-  source: Partial<PluginCatalogSourceCursor> | null | undefined,
-): PluginCatalogSourceCursor {
-  return {
-    cursor: typeof source?.cursor === "string" ? source.cursor : null,
-    offset: typeof source?.offset === "number" && source.offset > 0 ? source.offset : 0,
-    pageSize: typeof source?.pageSize === "number" && source.pageSize > 0 ? source.pageSize : 0,
-    done: source?.done === true,
-  };
-}
-
-function encodePluginCatalogCursor(state: PluginCatalogCursorState) {
-  return `plugcat:${encodeURIComponent(JSON.stringify(state))}`;
-}
-
-function decodePluginCatalogCursor(cursor: string | undefined): PluginCatalogCursorState {
-  if (!cursor?.startsWith("plugcat:")) {
-    return {
-      code: { ...DEFAULT_PLUGIN_SOURCE_CURSOR },
-      bundle: { ...DEFAULT_PLUGIN_SOURCE_CURSOR },
-    };
-  }
-  try {
-    const decoded = JSON.parse(decodeURIComponent(cursor.slice("plugcat:".length))) as {
-      code?: Partial<PluginCatalogSourceCursor>;
-      bundle?: Partial<PluginCatalogSourceCursor>;
-    };
-    return {
-      code: clonePluginSourceCursor(decoded.code),
-      bundle: clonePluginSourceCursor(decoded.bundle),
-    };
-  } catch {
-    return {
-      code: { ...DEFAULT_PLUGIN_SOURCE_CURSOR },
-      bundle: { ...DEFAULT_PLUGIN_SOURCE_CURSOR },
-    };
-  }
-}
-
-function comparePluginListItems(a: PackageListItem | undefined, b: PackageListItem | undefined) {
-  if (!a) return 1;
-  if (!b) return -1;
-  return (
-    b.updatedAt - a.updatedAt ||
-    b.createdAt - a.createdAt ||
-    a.name.localeCompare(b.name)
-  );
-}
 
 function normalizeApiPath(path: string) {
   return path.startsWith("/") ? path : `/${path}`;
@@ -334,144 +266,33 @@ export async function fetchPluginCatalog(params: {
     };
   }
 
-  const limit = Math.max(1, Math.min(params.limit ?? 25, 100));
-  const families: PluginFamily[] = ["code-plugin", "bundle-plugin"];
-
   if (params.q?.trim()) {
-    const results = await Promise.all(
-      families.map(async (family) => {
-        const response = await fetchPackages({
-          q: params.q,
-          family,
-          isOfficial: params.isOfficial,
-          executesCode: params.executesCode,
-          limit,
-        });
-        return "results" in response ? response.results : [];
-      }),
-    );
+    const url = await packageApiUrl(`${ApiRoutes.plugins}/search`);
+    url.searchParams.set("q", params.q.trim());
+    if (typeof params.limit === "number") url.searchParams.set("limit", String(params.limit));
+    if (typeof params.isOfficial === "boolean") {
+      url.searchParams.set("isOfficial", String(params.isOfficial));
+    }
+    if (typeof params.executesCode === "boolean") {
+      url.searchParams.set("executesCode", String(params.executesCode));
+    }
+    const response = await fetchJson<{ results: Array<{ score: number; package: PackageListItem }> }>(url);
     return {
-      items: results
-        .flat()
-        .sort(
-          (a, b) =>
-            b.score - a.score ||
-            Number(b.package.isOfficial) - Number(a.package.isOfficial) ||
-            b.package.updatedAt - a.package.updatedAt ||
-            a.package.name.localeCompare(b.package.name),
-        )
-        .slice(0, limit)
-        .map((entry) => entry.package),
+      items: response.results.map((entry) => entry.package),
       nextCursor: null,
     };
   }
 
-  const decodedCursor = decodePluginCatalogCursor(params.cursor);
-  const requests = await Promise.all(
-    families.map(async (family) => {
-      const source = family === "code-plugin" ? decodedCursor.code : decodedCursor.bundle;
-      if (source.done && source.offset === 0) {
-        return {
-          family,
-          source,
-          items: [] as PackageListItem[],
-          nextCursor: null,
-          effectivePageSize: source.pageSize,
-          pageCursor: source.cursor,
-          isDone: true,
-        };
-      }
-      const effectivePageSize =
-        source.offset > 0 && source.pageSize
-          ? Math.max(source.pageSize, source.offset + 1)
-          : Math.max(limit * 3, limit);
-      const response = await fetchPackages({
-        family,
-        cursor: source.cursor ?? undefined,
-        isOfficial: params.isOfficial,
-        executesCode: params.executesCode,
-        limit: effectivePageSize,
-      });
-      if ("results" in response) {
-        throw new Error("Expected list response for plugin catalog browse");
-      }
-      return {
-        family,
-        source,
-        items: response.items,
-        nextCursor: response.nextCursor,
-        effectivePageSize,
-        pageCursor: source.cursor,
-        isDone: response.nextCursor === null,
-      };
-    }),
-  );
-
-  const indexes: Record<PluginFamily, number> = {
-    "code-plugin": decodedCursor.code.offset,
-    "bundle-plugin": decodedCursor.bundle.offset,
-  };
-  const items: PackageListItem[] = [];
-
-  while (items.length < limit) {
-    const codeRequest = requests.find((entry) => entry.family === "code-plugin");
-    const bundleRequest = requests.find((entry) => entry.family === "bundle-plugin");
-    const codeItem =
-      codeRequest && indexes["code-plugin"] < codeRequest.items.length
-        ? codeRequest.items[indexes["code-plugin"]]
-        : undefined;
-    const bundleItem =
-      bundleRequest && indexes["bundle-plugin"] < bundleRequest.items.length
-        ? bundleRequest.items[indexes["bundle-plugin"]]
-        : undefined;
-    if (!codeItem && !bundleItem) break;
-    if (comparePluginListItems(codeItem, bundleItem) <= 0) {
-      items.push(codeItem!);
-      indexes["code-plugin"] += 1;
-    } else {
-      items.push(bundleItem!);
-      indexes["bundle-plugin"] += 1;
-    }
+  const url = await packageApiUrl(ApiRoutes.plugins);
+  if (params.cursor) url.searchParams.set("cursor", params.cursor);
+  if (typeof params.limit === "number") url.searchParams.set("limit", String(params.limit));
+  if (typeof params.isOfficial === "boolean") {
+    url.searchParams.set("isOfficial", String(params.isOfficial));
   }
-
-  const nextState: PluginCatalogCursorState = {
-    code: { ...DEFAULT_PLUGIN_SOURCE_CURSOR },
-    bundle: { ...DEFAULT_PLUGIN_SOURCE_CURSOR },
-  };
-
-  for (const request of requests) {
-    const nextOffset = indexes[request.family];
-    const nextSource =
-      nextOffset < request.items.length
-        ? {
-            cursor: request.pageCursor,
-            offset: nextOffset,
-            pageSize: request.effectivePageSize,
-            done: request.isDone,
-          }
-        : {
-            cursor: request.nextCursor,
-            offset: 0,
-            pageSize: request.effectivePageSize,
-            done: request.isDone,
-          };
-    if (request.family === "code-plugin") {
-      nextState.code = nextSource;
-    } else {
-      nextState.bundle = nextSource;
-    }
+  if (typeof params.executesCode === "boolean") {
+    url.searchParams.set("executesCode", String(params.executesCode));
   }
-
-  const isDone =
-    nextState.code.done &&
-    nextState.code.offset === 0 &&
-    nextState.bundle.done &&
-    nextState.bundle.offset === 0;
-
-  return {
-    items,
-    nextCursor: isDone ? null : encodePluginCatalogCursor(nextState),
-  };
+  return await fetchJson<PluginCatalogResult>(url);
 }
 
 export async function fetchPackageDetail(name: string) {

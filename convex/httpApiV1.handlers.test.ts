@@ -2,6 +2,7 @@
 import { unzipSync } from "fflate";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { internal } from "./_generated/api";
+import { RATE_LIMITS } from "./lib/httpRateLimit";
 
 vi.mock("@convex-dev/auth/server", () => ({
   getAuthUserId: vi.fn(),
@@ -39,6 +40,10 @@ function hasSlugArgs(args: unknown): args is { slug: string } {
   if (!args || typeof args !== "object") return false;
   const value = args as Record<string, unknown>;
   return typeof value.slug === "string";
+}
+
+function findRateLimitCallArgs(mock: ReturnType<typeof vi.fn>) {
+  return mock.mock.calls.map(([, args]) => args).find(isRateLimitArgs);
 }
 
 function makeCtx(partial: Record<string, unknown>) {
@@ -2294,13 +2299,10 @@ describe("httpApiV1 handlers", () => {
         capabilityTag: "tools",
       }),
     );
-    expect(runMutation).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({
-        key: expect.stringMatching(/^ip:/),
-        limit: 120,
-      }),
-    );
+    expect(findRateLimitCallArgs(runMutation)).toMatchObject({
+      key: expect.stringMatching(/^ip:/),
+      limit: RATE_LIMITS.read.ip,
+    });
     expect(response.headers.get("RateLimit-Limit")).toBeTruthy();
   });
 
@@ -2805,13 +2807,10 @@ describe("httpApiV1 handlers", () => {
 
     expect(response.status).toBe(200);
     expect(response.headers.get("RateLimit-Limit")).toBeTruthy();
-    expect(runMutation).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({
-        key: expect.stringMatching(/^ip:/),
-        limit: 20,
-      }),
-    );
+    expect(findRateLimitCallArgs(runMutation)).toMatchObject({
+      key: expect.stringMatching(/^ip:/),
+      limit: RATE_LIMITS.download.ip,
+    });
   });
 
   it("package file uses read rate limiting", async () => {
@@ -2868,13 +2867,10 @@ describe("httpApiV1 handlers", () => {
 
     expect(response.status).toBe(200);
     expect(response.headers.get("RateLimit-Limit")).toBeTruthy();
-    expect(runMutation).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({
-        key: expect.stringMatching(/^ip:/),
-        limit: 120,
-      }),
-    );
+    expect(findRateLimitCallArgs(runMutation)).toMatchObject({
+      key: expect.stringMatching(/^ip:/),
+      limit: RATE_LIMITS.read.ip,
+    });
   });
 
   it("package download uses a package/ root without registry metadata", async () => {
@@ -3201,13 +3197,10 @@ describe("httpApiV1 handlers", () => {
 
     expect(response.status).toBe(200);
     expect(response.headers.get("RateLimit-Limit")).toBeTruthy();
-    expect(runMutation).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({
-        key: "user:users:1",
-        limit: 120,
-      }),
-    );
+    expect(findRateLimitCallArgs(runMutation)).toMatchObject({
+      key: "user:users:1",
+      limit: RATE_LIMITS.write.key,
+    });
     expect(runAction).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
