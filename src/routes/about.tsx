@@ -15,12 +15,12 @@ const prohibitedCategories = [
   {
     title: 'Fraud and deception',
     examples:
-      'Fake certificates, fake invoices, deceptive payment flows, fake social proof, scam outreach, or tools that enable deceptive financial behavior.',
+      'Fake certificates, fake invoices, deceptive payment flows, fake social proof, scam outreach, or synthetic-identity workflows built to create accounts for fraud.',
   },
   {
     title: 'Privacy-invasive surveillance',
     examples:
-      'Mass contact scraping for spam, doxxing, stalking, covert monitoring, or biometric / face-matching workflows without clear consent.',
+      'Mass contact scraping for spam, doxxing, stalking, covert monitoring, biometric / face-matching workflows without clear consent, or buying, publishing, downloading, or operationalizing leaked data or breach dumps.',
   },
   {
     title: 'Non-consensual impersonation',
@@ -46,6 +46,8 @@ const recentPatterns = [
   'Generate professional certificates or invoices for arbitrary use.',
   'Generate NSFW content with safety checks disabled.',
   'Scrape leads, enrich contacts, and launch cold outreach at scale.',
+  'Buy, publish, or download leaked data or breach dumps.',
+  'Bulk-create email or social accounts with synthetic identities or CAPTCHA solving.',
 ];
 
 export const Route = createFileRoute('/about')({

@@ -21,10 +21,10 @@ These rules are intentionally practical. We care most about end-to-end abuse wor
   - Examples: stealth accounts after bans, account warming/farming, fake engagement, karma or follower cultivation, multi-account automation, mass posting, spam bots, marketplace or social automation built to avoid detection.
 
 - Fraud, scams, and deceptive financial workflows.
-  - Examples: fake certificates, fake invoices, deceptive payment flows, scam outreach, fake social proof, tools that enable spending or charging without clear human approval and transparent controls.
+  - Examples: fake certificates, fake invoices, deceptive payment flows, scam outreach, fake social proof, tools that enable spending or charging without clear human approval and transparent controls, or synthetic-identity workflows built to create accounts for fraud.
 
 - Privacy-invasive scraping, enrichment, or surveillance.
-  - Examples: scraping contact details at scale for spam, doxxing, stalking, lead extraction paired with unsolicited outreach, covert monitoring, face search or biometric matching used without clear consent.
+  - Examples: scraping contact details at scale for spam, doxxing, stalking, lead extraction paired with unsolicited outreach, covert monitoring, face search or biometric matching used without clear consent, or buying, publishing, downloading, or operationalizing leaked data or breach dumps.
 
 - Non-consensual impersonation or deceptive identity manipulation.
   - Examples: face swap, digital twins, fake personas, cloned influencers, or other identity-manipulation tooling used to impersonate or mislead.
@@ -43,6 +43,8 @@ These rules are intentionally practical. We care most about end-to-end abuse wor
 - “Generate professional certificates or invoices for arbitrary use.”
 - “Generate NSFW content with safety checks disabled.”
 - “Scrape leads, enrich contacts, and launch cold outreach at scale.”
+- “Buy, publish, or download leaked data or breach dumps.”
+- “Bulk-create email or social accounts with synthetic identities or CAPTCHA solving.”
 
 ## Notes for reviewers
 
